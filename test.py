@@ -1,7 +1,7 @@
 """
 VulneraBlog - A Deliberately Vulnerable Flask Application
 This application contains multiple vulnerabilities from the OWASP Top 10 for educational purposes.
-DO NOT USE IN PRODUCTION! 
+DO NOT USE IN PRODUCTION!
 """
 
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, make_response, send_file
