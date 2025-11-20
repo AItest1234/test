@@ -324,6 +324,12 @@ def _send_request(
             - headers_to_add: dict of headers to add/update (e.g., {"X-Test": "value"})
             - cookies_to_remove: list of cookie names to remove
             - cookies_to_add: dict of cookies to add/update
+            - method: change HTTP method (e.g., "POST", "PUT", "DELETE", "PATCH")
+            - query_params_to_add: dict of query parameters to add (e.g., {"debug": "true"})
+            - query_params_to_remove: list of query parameter names to remove
+            - body_content_type: change Content-Type (e.g., "application/xml", "text/plain")
+            - body_raw: completely replace body with raw string
+            - follow_redirects: bool to follow redirects (default: False)
     
     Returns:
         Response dict with status_code, headers, body, time or None on error
@@ -332,6 +338,7 @@ def _send_request(
     data = request.data
     headers = request.headers.copy()
     cookies = request.cookies.copy() if request.cookies else {}
+    method = request.method  # Can be overridden by modifications
 
     # Apply payload injection
     if payload_location and payload:
@@ -352,9 +359,59 @@ def _send_request(
                 log.error(f"Failed to inject payload into JSON for path '{path_to_modify}': {e}", extra={"markup": True})
                 return None
     
-    # Apply request modifications (for authentication testing, header manipulation, etc.)
+    # Apply request modifications (comprehensive support for all vulnerability types)
     if request_modifications:
-        # Remove headers (e.g., Authorization, JWT tokens)
+        # 1. HTTP Method Override (for testing method-based bypasses, CSRF, etc.)
+        if 'method' in request_modifications:
+            new_method = request_modifications['method'].upper()
+            log.debug(f"Changed HTTP method: {method} → {new_method}")
+            method = new_method
+        
+        # 2. Query Parameter Manipulation (for injection, SSRF, etc.)
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed_url = urlparse(url)
+        query_params = parse_qs(parsed_url.query, keep_blank_values=True)
+        
+        # Remove query parameters
+        query_params_to_remove = request_modifications.get('query_params_to_remove', [])
+        for param_name in query_params_to_remove:
+            if param_name in query_params:
+                query_params.pop(param_name)
+                log.debug(f"Removed query parameter: {param_name}")
+        
+        # Add query parameters
+        query_params_to_add = request_modifications.get('query_params_to_add', {})
+        for param_name, param_value in query_params_to_add.items():
+            query_params[param_name] = [param_value]
+            log.debug(f"Added query parameter: {param_name} = {param_value}")
+        
+        # Rebuild URL with modified query parameters
+        if query_params_to_remove or query_params_to_add:
+            new_query = urlencode(query_params, doseq=True)
+            url = urlunparse((
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                parsed_url.params,
+                new_query,
+                parsed_url.fragment
+            ))
+            log.debug(f"Modified URL: {url}")
+        
+        # 3. Body Content-Type Change (for injection attacks, XXE, etc.)
+        if 'body_content_type' in request_modifications:
+            new_content_type = request_modifications['body_content_type']
+            headers['Content-Type'] = new_content_type
+            log.debug(f"Changed Content-Type to: {new_content_type}")
+        
+        # 4. Raw Body Replacement (for complete body manipulation)
+        if 'body_raw' in request_modifications:
+            data = request_modifications['body_raw']
+            headers.pop('Content-Length', None)
+            headers.pop('content-length', None)
+            log.debug(f"Replaced body with raw content (length: {len(data) if data else 0})")
+        
+        # 5. Remove headers (e.g., Authorization, JWT tokens, CSRF tokens)
         headers_to_remove = request_modifications.get('headers_to_remove', [])
         for header_name in headers_to_remove:
             # Case-insensitive header removal
@@ -364,20 +421,20 @@ def _send_request(
                     removed_value = headers.pop(key, None)
                     log.debug(f"Removed header: {key} (value: {removed_value[:50] if removed_value else 'None'}...)")
         
-        # Add/update headers
+        # 6. Add/update headers (for header injection, SSRF, bypass techniques)
         headers_to_add = request_modifications.get('headers_to_add', {})
         for header_name, header_value in headers_to_add.items():
             headers[header_name] = header_value
             log.debug(f"Added/Updated header: {header_name} = {header_value}")
         
-        # Remove cookies
+        # 7. Remove cookies (for session testing, auth bypass)
         cookies_to_remove = request_modifications.get('cookies_to_remove', [])
         for cookie_name in cookies_to_remove:
             if cookie_name in cookies:
                 cookies.pop(cookie_name)
                 log.debug(f"Removed cookie: {cookie_name}")
         
-        # Add/update cookies
+        # 8. Add/update cookies (for session manipulation, injection)
         cookies_to_add = request_modifications.get('cookies_to_add', {})
         for cookie_name, cookie_value in cookies_to_add.items():
             cookies[cookie_name] = cookie_value
@@ -387,16 +444,20 @@ def _send_request(
     if proxy:
         proxies = {"http": proxy, "https": proxy}
 
+    # Check if we should follow redirects (default: False for security testing)
+    follow_redirects = request_modifications.get('follow_redirects', False) if request_modifications else False
+
     try:
         response = requests.request(
-            method=request.method,
+            method=method,  # Use potentially modified method
             url=url,
             headers=headers,
             data=data,
             cookies=cookies,
             verify=False,
             timeout=15,
-            proxies=proxies
+            proxies=proxies,
+            allow_redirects=follow_redirects
         )
         return {
             "status_code": response.status_code, 
@@ -539,21 +600,53 @@ Return ONLY a JSON array with structured test objects:
     "test_type": "...",
     "expected_indicator": "what indicates success",
     "request_modifications": {{
-      "headers_to_remove": ["Authorization", "X-API-Key"],  // Optional: headers to remove for auth bypass tests
-      "headers_to_add": {{"X-Custom": "value"}},  // Optional: headers to add
-      "cookies_to_remove": ["session"],  // Optional: cookies to remove
-      "cookies_to_add": {{"test": "value"}}  // Optional: cookies to add
+      // AUTH/ACCESS CONTROL:
+      "headers_to_remove": ["Authorization", "X-API-Key"],  // Remove auth headers
+      "headers_to_add": {{"X-Custom": "value"}},  // Add headers (SSRF, bypass)
+      "cookies_to_remove": ["session"],  // Remove cookies
+      "cookies_to_add": {{"test": "value"}},  // Add cookies
+      
+      // HTTP METHOD TESTING:
+      "method": "PUT",  // Override HTTP method (CSRF, method bypass)
+      
+      // QUERY PARAM MANIPULATION:
+      "query_params_to_add": {{"debug": "true"}},  // Add debug params
+      "query_params_to_remove": ["signature"],  // Remove signature validation
+      
+      // CONTENT-TYPE/BODY MANIPULATION:
+      "body_content_type": "application/xml",  // Change Content-Type (XXE, injection)
+      "body_raw": "<?xml version='1.0'?>...",  // Replace entire body (XXE, deserialization)
+      
+      // OTHER:
+      "follow_redirects": false  // Control redirect behavior
     }}
   }}
 ]
 
-**IMPORTANT FOR AUTHENTICATION TESTING:**
-- To test authentication bypass, include "headers_to_remove": ["Authorization"] or ["Bearer"]
-- To test without JWT, remove the Authorization header
-- To test session handling, manipulate cookies
-- For broken access control, try removing auth headers while accessing protected resources
+**COMPREHENSIVE TESTING GUIDE:**
 
-CRITICAL: Adapt payloads AND request modifications to the specific vulnerability category! Don't just use injection payloads for all categories."""
+**Authentication/Access Control (A01, A07):**
+- Remove Authorization headers, session cookies
+- Test protected endpoints without credentials
+
+**Injection (A03):**
+- Change Content-Type to test XXE (application/xml)
+- Add query parameters for injection points
+- Replace body for deserialization attacks
+
+**CSRF/Method Bypass (A05, A08):**
+- Change HTTP method (GET→POST, POST→PUT)
+- Remove CSRF tokens from headers/cookies
+
+**SSRF (A10):**
+- Add X-Forwarded-For, X-Real-IP headers
+- Add query parameters with internal URLs
+
+**Security Misconfiguration (A05):**
+- Add debug=true, trace=true query params
+- Change User-Agent to test version detection
+
+CRITICAL: Use request modifications appropriate for the vulnerability category being tested!"""
 
         else:
             # Subsequent iterations: hyper-targeted based on learned intelligence
@@ -589,15 +682,18 @@ Return ONLY JSON array with structured test objects:
     "reasoning": "why this based on findings",
     "expected_behavior": "what confirms vulnerability",
     "request_modifications": {{
-      "headers_to_remove": ["Authorization"],  // Optional: for auth bypass
-      "headers_to_add": {{"X-Custom": "value"}},  // Optional
-      "cookies_to_remove": ["session"],  // Optional
-      "cookies_to_add": {{"test": "value"}}  // Optional
+      "headers_to_remove": ["Authorization"],  // Auth bypass
+      "headers_to_add": {{"X-Forwarded-For": "127.0.0.1"}},  // SSRF, bypass
+      "cookies_to_remove": ["session"],  // Session testing
+      "method": "PUT",  // Method-based bypass
+      "query_params_to_add": {{"debug": "true"}},  // Debug mode
+      "body_content_type": "application/xml",  // XXE testing
+      "body_raw": "<?xml...>"  // Complete body replacement
     }}
   }}
 ]
 
-**For Authentication/Access Control tests, remember to manipulate headers/cookies as needed!**"""
+Use ALL available request modification capabilities based on what youve learned!"""
 
         # Get payload suggestions
         ai_response = _call_ai(generation_prompt)
@@ -997,6 +1093,21 @@ Use request_modifications to remove Authorization headers:
 **DEBUG MODE ENABLED:**
 - Check for debug=true parameters
 - Look for verbose logging in responses
+
+**USE REQUEST MODIFICATIONS:**
+Add debug/trace parameters:
+{
+  "request_modifications": {
+    "query_params_to_add": {"debug": "true", "trace": "1", "verbose": "true"}
+  }
+}
+
+Change User-Agent for version probing:
+{
+  "request_modifications": {
+    "headers_to_add": {"User-Agent": "Mozilla/5.0 (compatible; SecurityScanner/1.0)"}
+  }
+}
 """,
         
         "Vulnerable Components": """
@@ -1059,6 +1170,23 @@ Use request_modifications to remove Authorization headers:
 **.NET DESERIALIZATION:**
 - BinaryFormatter vulnerabilities
 - TypeNameHandling issues in JSON.NET
+
+**USE REQUEST MODIFICATIONS:**
+Change Content-Type for deserialization:
+{
+  "request_modifications": {
+    "body_content_type": "application/x-java-serialized-object",
+    "body_raw": "<base64_encoded_payload>"
+  }
+}
+
+Test with different HTTP methods:
+{
+  "request_modifications": {
+    "method": "PUT",
+    "body_content_type": "application/json"
+  }
+}
 """,
         
         "XXE": """
@@ -1074,6 +1202,15 @@ Use request_modifications to remove Authorization headers:
 
 **PARAMETER ENTITIES:**
 - Use parameter entities for blind extraction
+
+**CRITICAL FOR XXE TESTING:**
+Must use request_modifications to change Content-Type and body:
+{
+  "request_modifications": {
+    "body_content_type": "application/xml",
+    "body_raw": "<?xml version='1.0'?><!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><data>&xxe;</data>"
+  }
+}
 """,
         
         "Security Logging Failures": """
