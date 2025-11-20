@@ -239,7 +239,9 @@ def parse_raw_http_request(raw_request_string: str) -> ParsedHttpRequest:
     request_line = lines[0].strip()
     match = re.match(r'([A-Z]+)\s+([^?\s]+)(\?.*)?\s+HTTP/\d+(\.\d+)?', request_line)
     if not match: raise ValueError(f"Invalid request line: {request_line}")
-    method, path, query = match.groups()
+    method = match.group(1)
+    path = match.group(2)
+    query = match.group(3)
     path_with_query = path + (query or '')
     headers, body, header_section_finished = {}, "", False
     for line in lines[1:]:
