@@ -18,6 +18,25 @@
 **Files Changed**:
 - `analyzer.py` line 240: Updated request line regex pattern
 
+#### Request Body Parsing Without Blank Line
+
+**Problem**: When pasting HTTP requests without a blank line between headers and body (common when copy-pasting from tools), the request body (JSON, XML) was not being parsed. The body would either be silently ignored or incorrectly treated as a malformed header.
+
+**Solution**: Enhanced the parser to auto-detect body start even without a blank line:
+- Parser now checks if a line starts with `{`, `[`, or `<` (JSON/XML indicators)
+- If detected, treats that line as the start of the body automatically
+- Maintains backward compatibility with standard HTTP format (blank line separator)
+- Provides debug logging when non-standard format is detected
+
+**Benefits**:
+- ✅ Handles copy-pasted requests from Burp Suite, browser DevTools, etc.
+- ✅ Still works correctly with standard HTTP format
+- ✅ Supports JSON objects, JSON arrays, and XML bodies
+- ✅ User-friendly for penetration testing workflows
+
+**Files Changed**:
+- `analyzer.py` lines 244-267: Enhanced body detection logic
+
 ### Added
 
 #### Request Modification Support for VAPT Agent
