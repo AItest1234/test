@@ -491,6 +491,106 @@ def _send_request(
 
 # ==================== ADAPTIVE ITERATIVE ENGINE (FIXED) ====================
 
+def _verify_data_extraction(response: dict, payload: str, category: str, purpose: str) -> dict:
+    """
+    Verify if actual data was extracted from the exploitation payload.
+    Returns dict with: extracted: bool, data: str, data_type: str
+    """
+    
+    extraction_prompt = f"""Analyze if this exploitation payload SUCCESSFULLY EXTRACTED actual data.
+
+CATEGORY: {category}
+PAYLOAD: {payload}
+PURPOSE: {purpose}
+
+RESPONSE:
+- Status: {response.get('status_code', 0)}
+- Body: {response.get('body', '')[:2000]}
+
+=== VERIFICATION CRITERIA ===
+
+**SQL Injection - Look for:**
+- Database version strings (MySQL 5.7, PostgreSQL 14, etc.)
+- User names (@@ queries, USER(), CURRENT_USER)
+- Database names
+- Table/column names
+- Actual data from queries
+
+**Command Injection/RCE - Look for:**
+- OS version (Linux, Windows version strings)
+- Kernel version (uname output)
+- Hostname
+- Directory listings
+- File contents (/etc/passwd, /etc/hosts, etc.)
+- Command output
+
+**XXE - Look for:**
+- File contents (/etc/passwd, /etc/hostname)
+- Internal URLs resolved
+- XML entity expansion results
+
+**SSRF - Look for:**
+- AWS metadata (ami-id, instance-id, IAM roles)
+- Internal service responses
+- Port scan results
+
+**Path Traversal - Look for:**
+- File system paths
+- Configuration files
+- Source code
+- /etc/passwd contents
+
+**Access Control - Look for:**
+- Other users' data (IDs, emails, names)
+- Admin-only information
+- Unauthorized resource access
+
+RESPOND IN THIS FORMAT:
+
+DATA_EXTRACTED: [YES/NO]
+
+EXTRACTED_DATA: [The actual data found in the response - be specific]
+
+DATA_TYPE: [database_version/os_version/file_contents/user_data/admin_data/metadata/etc]
+
+CONFIDENCE: [0-100] - How confident are you that real data was extracted?
+
+EXPLANATION: [Brief explanation of what was found]"""
+
+    try:
+        analysis = _call_ai(extraction_prompt)
+        
+        # Parse the response
+        data_extracted_match = re.search(r'DATA_EXTRACTED:\s*(YES|NO)', analysis, re.IGNORECASE)
+        data_extracted = data_extracted_match.group(1).upper() == "YES" if data_extracted_match else False
+        
+        extracted_data_match = re.search(r'EXTRACTED_DATA:\s*([^\n]+)', analysis, re.IGNORECASE)
+        extracted_data = extracted_data_match.group(1).strip() if extracted_data_match else "None"
+        
+        data_type_match = re.search(r'DATA_TYPE:\s*([^\n]+)', analysis, re.IGNORECASE)
+        data_type = data_type_match.group(1).strip() if data_type_match else "unknown"
+        
+        confidence_match = re.search(r'CONFIDENCE:\s*(\d+)', analysis, re.IGNORECASE)
+        confidence = int(confidence_match.group(1)) if confidence_match else 0
+        
+        return {
+            "extracted": data_extracted,
+            "data": extracted_data,
+            "data_type": data_type,
+            "confidence": confidence,
+            "full_analysis": analysis
+        }
+    except Exception as e:
+        log.error(f"Error verifying data extraction: {e}")
+        return {
+            "extracted": False,
+            "data": "Error during verification",
+            "data_type": "unknown",
+            "confidence": 0,
+            "full_analysis": str(e)
+        }
+
+
 def _adaptive_payload_iteration(
     parsed_request: ParsedHttpRequest,
     proxy: str | None,
@@ -503,10 +603,14 @@ def _adaptive_payload_iteration(
     UNIVERSAL: Adaptive payload generation for ANY OWASP Top 10 vulnerability category.
     Generates next payload based on IMMEDIATE analysis of previous payload's response.
     Works for: Injection, Access Control, Auth, SSRF, XXE, Deserialization, etc.
+    
+    Only proceeds to exploitation when confidence > 80 is achieved.
+    Provides smart iteration with context of all previous payloads tested.
     """
     console = Console()
     
     successful_payloads = []
+    all_tested_payloads = []  # Track ALL payloads tested with their results
     accumulated_intelligence = {
         "technologies_detected": [],
         "error_patterns": [],
@@ -514,6 +618,12 @@ def _adaptive_payload_iteration(
         "response_behaviors": [],
         "security_indicators": []
     }
+    
+    # Track if we've achieved high confidence (>70) and exploitation status
+    high_confidence_achieved = False
+    exploitation_mode = False  # Switched to True when confidence >70
+    extracted_data = []  # Track successfully extracted data
+    successful_exploitation = False  # True when actual data is extracted
     
     # Category-specific testing strategies
     category_strategies = {
@@ -666,7 +776,21 @@ Return ONLY a JSON array with structured test objects:
 CRITICAL: Use request modifications appropriate for the vulnerability category being tested!"""
 
         else:
-            # Subsequent iterations: hyper-targeted based on learned intelligence
+            # Subsequent iterations: hyper-targeted based on learned intelligence AND previous payload context
+            
+            # Prepare previous payload context for AI
+            previous_payloads_context = []
+            for tested in all_tested_payloads[-10:]:  # Last 10 payloads for context
+                previous_payloads_context.append({
+                    "payload": tested.get('payload', 'N/A')[:100],
+                    "test_type": tested.get('test_type', 'unknown'),
+                    "structure": tested.get('payload_structure', 'N/A'),
+                    "confidence": tested.get('confidence', 0),
+                    "verdict": tested.get('verdict', 'unknown'),
+                    "request_modifications": tested.get('request_modifications', None),
+                    "key_observation": tested.get('key_observation', 'N/A')[:150]
+                })
+            
             generation_prompt = f"""{initial_context}
 
 === INTELLIGENCE GATHERED SO FAR ===
@@ -686,9 +810,20 @@ Response Behaviors:
 Error Patterns:
 {json.dumps(accumulated_intelligence['error_patterns'][:3], indent=2)}
 
+=== PREVIOUS PAYLOADS TESTED (LEARN FROM THESE) ===
+
+{json.dumps(previous_payloads_context, indent=2)}
+
+**CRITICAL: Learn from the payloads above!**
+- Build upon payloads with higher confidence scores
+- Use similar structures to what worked
+- Avoid patterns that yielded low confidence
+- Refine request_modifications based on what was effective
+- If a specific request modification led to higher confidence, keep using it
+
 === YOUR TASK FOR ITERATION {iteration} ===
 
-Based on the intelligence above, generate 3-5 HIGHLY TARGETED payloads/tests for {category}.
+Based on the intelligence AND previous payload patterns above, generate 3-5 HIGHLY TARGETED payloads/tests for {category}.
 
 {_get_adaptive_guidance(category, accumulated_intelligence)}
 
@@ -696,8 +831,9 @@ Return ONLY JSON array with structured test objects:
 [
   {{
     "payload": "...",
-    "reasoning": "why this based on findings",
+    "reasoning": "why this based on findings and previous payload patterns",
     "expected_behavior": "what confirms vulnerability",
+    "payload_structure": "describe the structure/pattern used",
     "request_modifications": {{
       "headers_to_remove": ["Authorization"],  // Auth bypass
       "headers_to_add": {{"X-Forwarded-For": "127.0.0.1"}},  // SSRF, bypass
@@ -710,7 +846,11 @@ Return ONLY JSON array with structured test objects:
   }}
 ]
 
-Use ALL available request modification capabilities based on what youve learned!"""
+**CRITICAL RULES:**
+1. Build upon successful payload patterns from previous iterations
+2. If previous high-confidence payloads used specific request_modifications, continue using them
+3. Refine and escalate based on what worked before
+4. Use ALL available request modification capabilities based on what youve learned!"""
 
         # Get payload suggestions
         ai_response = _call_ai(generation_prompt)
@@ -750,6 +890,31 @@ Use ALL available request modification capabilities based on what youve learned!
                 if not response:
                     log.warning(f"  [red]✗ Request failed[/red]")
                     continue
+                
+                # ===== EXPLOITATION MODE: VERIFY DATA EXTRACTION =====
+                if exploitation_mode:
+                    purpose = payload_obj.get('purpose', 'data extraction') if isinstance(payload_obj, dict) else 'data extraction'
+                    log.info(f"\n  [bold magenta]🔍 Verifying data extraction...[/bold magenta]")
+                    
+                    extraction_result = _verify_data_extraction(response, payload, category, purpose)
+                    
+                    if extraction_result['extracted']:
+                        log.info(f"  [bold green]✓✓✓ DATA EXTRACTED! {extraction_result['data_type']}[/bold green]")
+                        log.info(f"  [bold green]📊 Extracted: {extraction_result['data'][:200]}[/bold green]")
+                        
+                        extracted_data.append({
+                            "payload": payload,
+                            "data": extraction_result['data'],
+                            "data_type": extraction_result['data_type'],
+                            "confidence": extraction_result['confidence'],
+                            "purpose": purpose,
+                            "response": clean_response_data(response)
+                        })
+                        
+                        successful_exploitation = True
+                        log.info(f"  [bold green]✓ SUCCESSFUL EXPLOITATION! Total extractions: {len(extracted_data)}[/bold green]")
+                    else:
+                        log.info(f"  [yellow]⚠ No data extracted yet. Continuing...[/yellow]")
                 
                 # ===== STEP 3: CATEGORY-AWARE DEEP ANALYSIS =====
                 analysis_prompt = f"""CRITICAL: Perform DEEP ANALYSIS specific to {category} vulnerability.
@@ -861,6 +1026,12 @@ STOP_TESTING: [YES/NO - sufficient confirmation?]"""
                     if behavior_text and len(behavior_text) > 10:
                         accumulated_intelligence['response_behaviors'].append(behavior_text[:300])
                 
+                # Extract key observation for payload history
+                key_observation = ""
+                key_evidence_section = re.search(r'KEY_EVIDENCE:(.*?)(?=EXPLOITATION_PATH|NEXT_RECOMMENDED|$)', analysis, re.DOTALL | re.IGNORECASE)
+                if key_evidence_section:
+                    key_observation = key_evidence_section.group(1).strip()[:150]
+                
                 # Log verdict
                 if verdict == "VULNERABLE":
                     log.info(f"  [bold green]✓✓✓ VULNERABLE (Confidence: {confidence}%)[/bold green]")
@@ -878,62 +1049,109 @@ STOP_TESTING: [YES/NO - sufficient confirmation?]"""
                     "confidence": confidence,
                     "response": clean_response_data(response),
                     "analysis": str(analysis),
-                    "iteration": iteration
+                    "iteration": iteration,
+                    "request_modifications": request_modifications,  # Store modifications used
+                    "payload_structure": payload_obj.get('payload_structure', 'unknown') if isinstance(payload_obj, dict) else 'unknown',
+                    "key_observation": key_observation
                 }
                 
-                # If vulnerable or potentially vulnerable, add to successful list
-                if verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence >= 60:
-                    successful_payloads.append(result)
-                    log.info(f"  [bold green]Added to successful findings (Total: {len(successful_payloads)})[/bold green]")
+                # Track ALL tested payloads for smart iteration
+                all_tested_payloads.append(result)
                 
-                # ===== STEP 5: GENERATE IMMEDIATE FOLLOW-UP IF HIGH CONFIDENCE =====
-                if verdict == "VULNERABLE" and confidence >= 80:
-                    log.info(f"\n[bold green]  🚀 HIGH CONFIDENCE! Generating immediate escalation tests...[/bold green]")
+                # If vulnerable with confidence > 70, mark for immediate exploitation
+                if verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence > 70:
+                    high_confidence_achieved = True
+                    exploitation_mode = True  # Switch to exploitation mode
+                    successful_payloads.append(result)
+                    log.info(f"  [bold green]✓✓✓ CONFIDENCE > 70 ACHIEVED! Switching to EXPLOITATION MODE...[/bold green]")
+                # If confidence >= 60, add to successful list for tracking
+                elif verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence >= 60:
+                    successful_payloads.append(result)
+                    log.info(f"  [bold yellow]Added to successful findings (needs higher confidence - Total: {len(successful_payloads)})[/bold yellow]")
+                
+                # ===== STEP 5: IMMEDIATE EXPLOITATION IF CONFIDENCE > 70 =====
+                if verdict == "VULNERABLE" and confidence > 70:
+                    log.info(f"\n[bold green]  🚀 CONFIDENCE > 70! Switching to EXPLOITATION mode...[/bold green]")
                     
                     # Include info about what modifications were used if any
                     modifications_used = ""
                     if request_modifications:
                         modifications_used = f"\nREQUEST MODIFICATIONS USED: {safe_json_dumps(request_modifications)}"
                     
-                    immediate_followup_prompt = f"""CONFIRMED {category} vulnerability! Generate 2-3 IMMEDIATE escalation tests.
+                    exploitation_prompt = f"""VULNERABILITY CONFIRMED with confidence {confidence}%! Now EXPLOIT it to extract REAL DATA.
 
-SUCCESSFUL TEST: {payload}{modifications_used}
+SUCCESSFUL DETECTION PAYLOAD: {payload}{modifications_used}
 ANALYSIS: {analysis[:1000]}
 
-Generate tests that:
-1. Escalate this confirmed vulnerability
-2. Extract meaningful proof safely
-3. Use the SAME attack vector that worked
-4. Are specific to {category} category
-5. If auth bypass was successful, continue testing without authentication
+=== EXPLOITATION GOAL ===
+Generate 3-5 exploitation payloads that will ACTUALLY EXTRACT DATA:
+
+**For SQL Injection:**
+- Extract database version (@@version, version())
+- Get current user/database name
+- List tables/columns
+- Extract actual data from tables
+
+**For Command Injection/RCE:**
+- Get OS version (uname -a, ver, cat /etc/os-release)
+- Get hostname
+- List current directory
+- Read sensitive files
+
+**For XXE:**
+- Read /etc/passwd or /etc/hostname
+- Extract internal file contents
+- SSRF to internal services
+
+**For SSRF:**
+- Access AWS metadata (169.254.169.254)
+- Read internal services
+- Port scanning results
+
+**For Access Control:**
+- Access other users' data
+- Read admin-only resources
+- Modify protected resources
+
+**For Path Traversal:**
+- Read /etc/passwd
+- Read application config files
+- Access source code
+
+=== CRITICAL REQUIREMENTS ===
+1. Use the EXACT SAME attack vector and structure that worked
+2. Maintain the SAME request_modifications
+3. Generate payloads that will extract VERIFIABLE data
+4. Be AGGRESSIVE - we need proof of exploitation
+5. Category: {category}
 
 Return ONLY JSON array:
 [
   {{
     "payload": "...",
-    "purpose": "what it will demonstrate/extract",
-    "request_modifications": {{
-      "headers_to_remove": ["Authorization"],  // If previous test removed auth
-      "headers_to_add": {{"X-Custom": "value"}},  // Optional
-      "cookies_to_remove": ["session"],  // Optional
-      "cookies_to_add": {{"test": "value"}}  // Optional
-    }}
+    "purpose": "Extract [specific data like DB version, OS info, etc.]",
+    "expected_data": "What specific data should appear in response",
+    "payload_structure": "same structure as successful payload",
+    "request_modifications": {modifications_used if modifications_used else "{}"}
   }}
 ]"""
                     
-                    immediate_response = _call_ai(immediate_followup_prompt)
-                    immediate_cleaned = _extract_json_from_ai_response(immediate_response)
-                    immediate_payloads = safe_json_parse(immediate_cleaned, default=[])
+                    exploitation_response = _call_ai(exploitation_prompt)
+                    exploitation_cleaned = _extract_json_from_ai_response(exploitation_response)
+                    exploitation_payloads = safe_json_parse(exploitation_cleaned, default=[])
                     
-                    if isinstance(immediate_payloads, list) and immediate_payloads:
-                        log.info(f"  [cyan]Generated {len(immediate_payloads)} immediate follow-up tests[/cyan]")
-                        payload_batch = payload_batch[:payload_idx] + immediate_payloads + payload_batch[payload_idx:]
+                    if isinstance(exploitation_payloads, list) and exploitation_payloads:
+                        log.info(f"  [bold cyan]Generated {len(exploitation_payloads)} EXPLOITATION payloads[/bold cyan]")
+                        # Insert exploitation payloads immediately into the batch
+                        payload_batch = payload_batch[:payload_idx] + exploitation_payloads + payload_batch[payload_idx:]
                 
-                # Check if AI recommends stopping
+                # Check if AI recommends stopping (only if high confidence achieved)
                 stop_match = re.search(r'STOP_TESTING:\s*(YES|NO)', analysis, re.IGNORECASE)
-                if stop_match and stop_match.group(1).upper() == "YES" and len(successful_payloads) >= 3:
-                    log.info(f"\n[bold green]✓ Sufficient confirmation for {category} ({len(successful_payloads)} successful findings)[/bold green]")
-                    return successful_payloads
+                if stop_match and stop_match.group(1).upper() == "YES" and high_confidence_achieved and len(successful_payloads) >= 2:
+                    log.info(f"\n[bold green]✓ High confidence confirmation achieved for {category} ({len(successful_payloads)} successful findings)[/bold green]")
+                    # Return only high-confidence payloads (>80)
+                    high_conf_payloads = [p for p in successful_payloads if p.get('confidence', 0) > 80]
+                    return high_conf_payloads if high_conf_payloads else successful_payloads
                 
             except Exception as e:
                 log.error(f"  [red]Error processing test {payload_idx}: {e}[/red]")
@@ -944,16 +1162,51 @@ Return ONLY JSON array:
         console.print(f"  • Technologies Detected: {len(set(accumulated_intelligence['technologies_detected']))}")
         console.print(f"  • Working Attack Vectors: {len(set(accumulated_intelligence['working_attack_vectors']))}")
         console.print(f"  • Security Indicators: {len(accumulated_intelligence['security_indicators'])}")
-        console.print(f"  • Total Successful Findings: {len(successful_payloads)}")
+        console.print(f"  • Total Payloads Tested: {len(all_tested_payloads)}")
+        console.print(f"  • Successful Findings: {len(successful_payloads)}")
         
-        # Check if we have strong confirmation
-        if len(successful_payloads) >= 3:
-            high_confidence_count = sum(1 for p in successful_payloads if p.get('confidence', 0) >= 80)
-            if high_confidence_count >= 2:
-                log.info(f"\n[bold green]✓✓✓ STRONG CONFIRMATION for {category}: {high_confidence_count} high-confidence findings.[/bold green]")
-                break
+        # Check exploitation status
+        if exploitation_mode:
+            console.print(f"  • [bold magenta]EXPLOITATION MODE: ACTIVE[/bold magenta]")
+            console.print(f"  • [bold green]Data Extractions: {len(extracted_data)}[/bold green]")
+            
+            if extracted_data:
+                console.print(f"\n[bold green]📊 Extracted Data:[/bold green]")
+                for idx, extract in enumerate(extracted_data, 1):
+                    console.print(f"  [{idx}] {extract['data_type']}: {extract['data'][:100]}")
+        
+        # Check if we have high confidence confirmation (>70 for exploitation)
+        high_confidence_payloads = [p for p in successful_payloads if p.get('confidence', 0) > 70]
+        console.print(f"  • High Confidence Payloads (>70): {len(high_confidence_payloads)}")
+        
+        # Exit conditions: successful exploitation with data extracted
+        if exploitation_mode and successful_exploitation and len(extracted_data) >= 2:
+            log.info(f"\n[bold green]✓✓✓ SUCCESSFUL EXPLOITATION for {category}![/bold green]")
+            log.info(f"[bold green]✓ {len(extracted_data)} data extractions successful[/bold green]")
+            log.info(f"[bold green]Exploitation complete. Returning results...[/bold green]")
+            break
+        elif exploitation_mode and len(extracted_data) >= 1:
+            log.info(f"\n[bold green]✓ Data extracted but continuing for more...[/bold green]")
+        elif exploitation_mode:
+            log.info(f"\n[yellow]Exploitation mode active but no data extracted yet. Continuing...[/yellow]")
+        elif high_confidence_achieved:
+            log.info(f"\n[bold green]✓ Confidence > 70 achieved, exploitation mode will activate[/bold green]")
+        else:
+            log.info(f"\n[yellow]Building confidence (need >70 to start exploitation)...[/yellow]")
     
-    return successful_payloads
+    # Return results with extracted data
+    if extracted_data:
+        log.info(f"\n[bold green]✓✓✓ EXPLOITATION SUCCESSFUL! Returning {len(extracted_data)} data extractions.[/bold green]")
+        # Add extracted data to successful payloads
+        for payload in successful_payloads:
+            payload['extracted_data'] = extracted_data
+        return successful_payloads
+    elif high_confidence_payloads:
+        log.info(f"\n[bold yellow]Confidence > 70 achieved but no data extracted. Returning {len(high_confidence_payloads)} high-confidence findings.[/bold yellow]")
+        return high_confidence_payloads
+    else:
+        log.warning(f"\n[yellow]No high confidence or data extraction achieved.[/yellow]")
+        return successful_payloads
 
 def _get_category_testing_guide(category: str) -> str:
     """Returns category-specific testing guidelines."""
@@ -1443,11 +1696,29 @@ def _adaptive_poc_generation(
     # Category-specific PoC guidance
     poc_guidance = _get_poc_guidance(category)
     
+    # Prepare payload structures that worked for context
+    successful_payload_structures = []
+    for result in confirmation_results:
+        successful_payload_structures.append({
+            "payload": result.get('payload', 'N/A')[:100],
+            "structure": result.get('payload_structure', 'N/A'),
+            "confidence": result.get('confidence', 0),
+            "request_modifications": result.get('request_modifications', None)
+        })
+    
     # Generate targeted PoC
-    poc_prompt = f"""A {category} vulnerability is CONFIRMED. Generate 6-10 SAFE PoC payloads/tests.
+    poc_prompt = f"""A {category} vulnerability is CONFIRMED with HIGH CONFIDENCE (>80). Generate 6-10 SAFE PoC payloads/tests.
 
-=== CONFIRMED FINDINGS ===
+=== HIGH CONFIDENCE CONFIRMED FINDINGS ===
 {safe_json_dumps(successful_patterns)}
+
+=== SUCCESSFUL PAYLOAD STRUCTURES (USE THESE AS TEMPLATES) ===
+{safe_json_dumps(successful_payload_structures)}
+
+**CRITICAL: Build upon the successful payload structures above!**
+- Use similar patterns and structures
+- Maintain the same request_modifications that worked
+- Escalate based on what was successful
 
 === TECHNOLOGIES DETECTED ===
 {', '.join(set(technologies_detected)) if technologies_detected else 'Unknown'}
@@ -1459,12 +1730,13 @@ def _adaptive_poc_generation(
 {poc_guidance}
 
 **CRITICAL RULES:**
-1. Use the SAME attack vector that worked during confirmation
-2. Extract SAFE, harmless information only
-3. Demonstrate impact without causing damage
-4. Adapt to specific technology/framework detected
-5. Provide clear evidence of vulnerability
-6. Be specific to {category} vulnerability type
+1. Use the SAME attack vector AND structure that worked during confirmation
+2. If successful payloads used request_modifications, KEEP USING THEM
+3. Extract SAFE, harmless information only
+4. Demonstrate impact without causing damage
+5. Adapt to specific technology/framework detected
+6. Provide clear evidence of vulnerability
+7. Be specific to {category} vulnerability type
 
 Return JSON array:
 [
@@ -1473,6 +1745,7 @@ Return JSON array:
     "purpose": "what it demonstrates/extracts",
     "safe": true,
     "expected_result": "what indicates success",
+    "payload_structure": "structure/pattern being used",
     "request_modifications": {{
       "headers_to_remove": ["Authorization"],  // If auth bypass is being tested
       "headers_to_add": {{"X-Custom": "value"}},  // Optional
@@ -1482,7 +1755,7 @@ Return JSON array:
   }}
 ]
 
-**For Auth/Access Control PoCs, include request_modifications to remove auth headers/cookies!**"""
+**MAINTAIN CONSISTENCY: If the confirmed payloads removed Authorization headers, your PoC payloads should too!**"""
 
     ai_response = _call_ai(poc_prompt)
     cleaned_response = _extract_json_from_ai_response(ai_response)
@@ -1987,17 +2260,58 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
             log.info(f"[yellow]No confirmation achieved for '{category}' after adaptive testing. Skipping.[/yellow]")
             continue
         
-        log.info(f"[bold green]✓ Vulnerability CONFIRMED for '{category}' with {len(successful_confirmations)} successful payloads![/bold green]")
-
-        # ===== STAGE 3: ADAPTIVE POC =====
-        status.update(f"[cyan]Stage 3/3: Generating adaptive PoC for '{category}'...[/]")
+        # Check if data was extracted during exploitation
+        extracted_data = successful_confirmations[0].get('extracted_data', []) if successful_confirmations else []
         
+        if extracted_data:
+            log.info(f"[bold green]✓✓✓ EXPLOITATION SUCCESSFUL for '{category}'![/bold green]")
+            log.info(f"[bold green]✓ {len(extracted_data)} data points extracted![/bold green]")
+            
+            # Display extracted data
+            console.print(f"\n[bold green]📊 Extracted Data Summary:[/bold green]")
+            for idx, data_point in enumerate(extracted_data, 1):
+                console.print(f"  [{idx}] {data_point['data_type']}: {data_point['data'][:150]}")
+            
+            # Skip PoC generation since we already have real exploitation
+            log.info(f"[bold cyan]Skipping PoC generation - real data already extracted![/bold cyan]")
+            
+            # Build detailed finding with exploitation data
+            final_findings.append({
+                "category": category,
+                "severity": "Critical" if "injection" in category.lower() else "High",
+                "detection_reasoning": detection_reasoning,
+                "confirmation_payloads": successful_confirmations,
+                "exploitation_successful": True,
+                "extracted_data": extracted_data,
+                "confirmation_summary": f"Vulnerability exploited successfully with {len(extracted_data)} data extractions",
+                "poc_payloads": [],  # Not needed - we have real exploitation
+                "poc_summary": f"Real exploitation performed - {len(extracted_data)} data points extracted",
+                "adaptive_iterations": "Exploitation mode activated at confidence >70, data successfully extracted"
+            })
+            
+            continue  # Skip to next category
+        
+        # Check if any high-confidence confirmations exist (>70) but no data extracted
+        high_confidence_confirmations = [p for p in successful_confirmations if p.get('confidence', 0) > 70]
+        
+        if not high_confidence_confirmations:
+            log.warning(f"[yellow]Confirmations found for '{category}' but confidence not high enough (≤70) and no data extracted.[/yellow]")
+            log.info(f"[yellow]Found {len(successful_confirmations)} payloads with confidence 60-70.[/yellow]")
+            continue
+        
+        log.info(f"[bold green]✓✓✓ High Confidence VULNERABILITY CONFIRMED for '{category}' with {len(high_confidence_confirmations)} payloads (confidence > 70)![/bold green]")
+        log.info(f"[bold yellow]⚠ No data extraction during testing. Generating PoC...[/bold yellow]")
+
+        # ===== STAGE 3: ADAPTIVE POC (Only if no data was extracted during exploitation) =====
+        status.update(f"[cyan]Stage 3/3: Generating adaptive PoC for '{category}' (High confidence but no extraction)...[/]")
+        
+        # Pass only high-confidence confirmations to PoC generation
         successful_poc = _adaptive_poc_generation(
             parsed_request=parsed_request,
             proxy=proxy,
             param_to_test=param_to_test,
             category=category,
-            confirmation_results=successful_confirmations
+            confirmation_results=high_confidence_confirmations  # Only high-confidence results
         )
         
         if not successful_poc:
@@ -2011,11 +2325,11 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
             "category": category,
             "severity": "Critical" if "injection" in category.lower() else "High",
             "detection_reasoning": detection_reasoning,
-            "confirmation_payloads": successful_confirmations,
-            "confirmation_summary": f"{len(successful_confirmations)} payloads confirmed vulnerability through adaptive testing",
+            "confirmation_payloads": high_confidence_confirmations,  # Only high-confidence confirmations
+            "confirmation_summary": f"{len(high_confidence_confirmations)} high-confidence payloads (>80) confirmed vulnerability through adaptive testing",
             "poc_payloads": successful_poc,
             "poc_summary": f"{len([p for p in successful_poc if p['payload'] != 'N/A'])} PoC payloads successful",
-            "adaptive_iterations": "Multiple iterations with learning applied"
+            "adaptive_iterations": "Multiple iterations with learning applied, high confidence achieved (>80)"
         })
 
     # ===== FINAL REPORT GENERATION =====
