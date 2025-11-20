@@ -2,6 +2,22 @@
 
 ## [Unreleased] - 2024-11-20
 
+### Fixed
+
+#### HTTP/2 and HTTP/3 Request Parsing Support
+
+**Problem**: The HTTP request parser only supported HTTP/1.x versions (HTTP/1.0, HTTP/1.1) and would fail to parse valid HTTP/2 and HTTP/3 requests with the error "Invalid request line".
+
+**Solution**: Updated the request line regex pattern in `parse_raw_http_request()` to support all valid HTTP versions:
+- Changed regex from `HTTP/\d\.\d` to `HTTP/\d+(\.\d+)?`
+- Now supports:
+  - HTTP/0.9, HTTP/1.0, HTTP/1.1 (with decimal versions)
+  - HTTP/2, HTTP/3 (single digit versions)
+  - Future HTTP versions
+
+**Files Changed**:
+- `analyzer.py` line 240: Updated request line regex pattern
+
 ### Added
 
 #### Request Modification Support for VAPT Agent
