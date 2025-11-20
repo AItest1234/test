@@ -9,6 +9,12 @@ from rich.panel import Panel
 from .config import setup_logging, OWASP_CATEGORIES
 from .analyzer import perform_full_workflow, parse_raw_http_request, find_request_parameters
 from .reporter import generate_report
+from .ui_components import (
+    print_banner, 
+    create_warning_panel, 
+    create_target_info_panel,
+    print_info
+)
 
 app = typer.Typer()
 console = Console()
@@ -23,10 +29,11 @@ def analyze(
     """
     setup_logging(debug)
     
-    console.print(Panel("[bold green]--- VAPT AI Agent CLI (Active Scanner Mode) ---[/bold green]"))
+    # Display improved banner
+    print_banner()
     
     if proxy:
-        console.print(f"[bold yellow]! Using proxy:[/] [cyan]{proxy}[/cyan]")
+        print_info(f"All traffic will be routed through: {proxy}", "Proxy Configuration")
 
     console.print("\n[bold]Step 0: Provide Raw HTTP Request[/bold]")
     console.print("Paste the request below and press Ctrl+D (or Ctrl+Z+Enter on Windows) to continue.")
@@ -52,20 +59,23 @@ def analyze(
         console.print("[yellow]No categories selected. Exiting.[/yellow]"); raise typer.Exit()
     selected_categories = owasp_answers['categories']
     
-    console.print(f"\n[bold]Selected Parameters:[/] [cyan]{', '.join(selected_params) if selected_params else 'All'}[/cyan]")
-    console.print(f"[bold]Selected Categories:[/] [cyan]{', '.join(selected_categories)}[/cyan]")
-
-    console.print(Panel("""
-[bold red]!!! WARNING: ACTIVE SCANNING MODE !!![/bold red]
-This tool will send potentially malicious payloads to the target.
-- Ensure you have [underline]explicit, written permission[/underline] to test this system.
-- Understand that this may trigger security alerts or cause unintended side effects.
-""", title="[yellow]ACTION REQUIRED[/yellow]", border_style="yellow"))
+    # Display target information in a nice panel
+    console.print("\n")
+    create_target_info_panel(
+        method=parsed_req.method,
+        url=parsed_req.url,
+        categories=selected_categories,
+        params=selected_params
+    )
     
-    if not Confirm.ask("[bold]Do you acknowledge the risks and have permission to proceed?[/bold]", default=False):
+    # Display warning panel
+    console.print("\n")
+    create_warning_panel()
+    
+    if not Confirm.ask("\n[bold cyan]Do you acknowledge the risks and have permission to proceed?[/bold cyan]", default=False):
         console.print("[red]Analysis aborted by user.[/red]"); raise typer.Exit()
 
-    console.print("\n[bold]Starting 3-Stage Analysis...[/bold]\n")
+    console.print("\n")
     findings = perform_full_workflow(raw_request_input, selected_categories, selected_params, proxy) # Pass proxy here
         
 if __name__ == "__main__":
