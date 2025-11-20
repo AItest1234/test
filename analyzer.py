@@ -503,10 +503,14 @@ def _adaptive_payload_iteration(
     UNIVERSAL: Adaptive payload generation for ANY OWASP Top 10 vulnerability category.
     Generates next payload based on IMMEDIATE analysis of previous payload's response.
     Works for: Injection, Access Control, Auth, SSRF, XXE, Deserialization, etc.
+    
+    Only proceeds to exploitation when confidence > 80 is achieved.
+    Provides smart iteration with context of all previous payloads tested.
     """
     console = Console()
     
     successful_payloads = []
+    all_tested_payloads = []  # Track ALL payloads tested with their results
     accumulated_intelligence = {
         "technologies_detected": [],
         "error_patterns": [],
@@ -514,6 +518,9 @@ def _adaptive_payload_iteration(
         "response_behaviors": [],
         "security_indicators": []
     }
+    
+    # Track if we've achieved high confidence (>80)
+    high_confidence_achieved = False
     
     # Category-specific testing strategies
     category_strategies = {
@@ -666,7 +673,21 @@ Return ONLY a JSON array with structured test objects:
 CRITICAL: Use request modifications appropriate for the vulnerability category being tested!"""
 
         else:
-            # Subsequent iterations: hyper-targeted based on learned intelligence
+            # Subsequent iterations: hyper-targeted based on learned intelligence AND previous payload context
+            
+            # Prepare previous payload context for AI
+            previous_payloads_context = []
+            for tested in all_tested_payloads[-10:]:  # Last 10 payloads for context
+                previous_payloads_context.append({
+                    "payload": tested.get('payload', 'N/A')[:100],
+                    "test_type": tested.get('test_type', 'unknown'),
+                    "structure": tested.get('payload_structure', 'N/A'),
+                    "confidence": tested.get('confidence', 0),
+                    "verdict": tested.get('verdict', 'unknown'),
+                    "request_modifications": tested.get('request_modifications', None),
+                    "key_observation": tested.get('key_observation', 'N/A')[:150]
+                })
+            
             generation_prompt = f"""{initial_context}
 
 === INTELLIGENCE GATHERED SO FAR ===
@@ -686,9 +707,20 @@ Response Behaviors:
 Error Patterns:
 {json.dumps(accumulated_intelligence['error_patterns'][:3], indent=2)}
 
+=== PREVIOUS PAYLOADS TESTED (LEARN FROM THESE) ===
+
+{json.dumps(previous_payloads_context, indent=2)}
+
+**CRITICAL: Learn from the payloads above!**
+- Build upon payloads with higher confidence scores
+- Use similar structures to what worked
+- Avoid patterns that yielded low confidence
+- Refine request_modifications based on what was effective
+- If a specific request modification led to higher confidence, keep using it
+
 === YOUR TASK FOR ITERATION {iteration} ===
 
-Based on the intelligence above, generate 3-5 HIGHLY TARGETED payloads/tests for {category}.
+Based on the intelligence AND previous payload patterns above, generate 3-5 HIGHLY TARGETED payloads/tests for {category}.
 
 {_get_adaptive_guidance(category, accumulated_intelligence)}
 
@@ -696,8 +728,9 @@ Return ONLY JSON array with structured test objects:
 [
   {{
     "payload": "...",
-    "reasoning": "why this based on findings",
+    "reasoning": "why this based on findings and previous payload patterns",
     "expected_behavior": "what confirms vulnerability",
+    "payload_structure": "describe the structure/pattern used",
     "request_modifications": {{
       "headers_to_remove": ["Authorization"],  // Auth bypass
       "headers_to_add": {{"X-Forwarded-For": "127.0.0.1"}},  // SSRF, bypass
@@ -710,7 +743,11 @@ Return ONLY JSON array with structured test objects:
   }}
 ]
 
-Use ALL available request modification capabilities based on what youve learned!"""
+**CRITICAL RULES:**
+1. Build upon successful payload patterns from previous iterations
+2. If previous high-confidence payloads used specific request_modifications, continue using them
+3. Refine and escalate based on what worked before
+4. Use ALL available request modification capabilities based on what youve learned!"""
 
         # Get payload suggestions
         ai_response = _call_ai(generation_prompt)
@@ -861,6 +898,12 @@ STOP_TESTING: [YES/NO - sufficient confirmation?]"""
                     if behavior_text and len(behavior_text) > 10:
                         accumulated_intelligence['response_behaviors'].append(behavior_text[:300])
                 
+                # Extract key observation for payload history
+                key_observation = ""
+                key_evidence_section = re.search(r'KEY_EVIDENCE:(.*?)(?=EXPLOITATION_PATH|NEXT_RECOMMENDED|$)', analysis, re.DOTALL | re.IGNORECASE)
+                if key_evidence_section:
+                    key_observation = key_evidence_section.group(1).strip()[:150]
+                
                 # Log verdict
                 if verdict == "VULNERABLE":
                     log.info(f"  [bold green]✓✓✓ VULNERABLE (Confidence: {confidence}%)[/bold green]")
@@ -878,13 +921,24 @@ STOP_TESTING: [YES/NO - sufficient confirmation?]"""
                     "confidence": confidence,
                     "response": clean_response_data(response),
                     "analysis": str(analysis),
-                    "iteration": iteration
+                    "iteration": iteration,
+                    "request_modifications": request_modifications,  # Store modifications used
+                    "payload_structure": payload_obj.get('payload_structure', 'unknown') if isinstance(payload_obj, dict) else 'unknown',
+                    "key_observation": key_observation
                 }
                 
-                # If vulnerable or potentially vulnerable, add to successful list
-                if verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence >= 60:
+                # Track ALL tested payloads for smart iteration
+                all_tested_payloads.append(result)
+                
+                # If vulnerable or potentially vulnerable with confidence > 80, mark high confidence achieved
+                if verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence > 80:
+                    high_confidence_achieved = True
                     successful_payloads.append(result)
-                    log.info(f"  [bold green]Added to successful findings (Total: {len(successful_payloads)})[/bold green]")
+                    log.info(f"  [bold green]✓✓✓ HIGH CONFIDENCE ACHIEVED! Added to successful findings (Total: {len(successful_payloads)})[/bold green]")
+                # If confidence >= 60, add to successful list for tracking
+                elif verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence >= 60:
+                    successful_payloads.append(result)
+                    log.info(f"  [bold yellow]Added to successful findings (needs higher confidence - Total: {len(successful_payloads)})[/bold yellow]")
                 
                 # ===== STEP 5: GENERATE IMMEDIATE FOLLOW-UP IF HIGH CONFIDENCE =====
                 if verdict == "VULNERABLE" and confidence >= 80:
@@ -929,11 +983,13 @@ Return ONLY JSON array:
                         log.info(f"  [cyan]Generated {len(immediate_payloads)} immediate follow-up tests[/cyan]")
                         payload_batch = payload_batch[:payload_idx] + immediate_payloads + payload_batch[payload_idx:]
                 
-                # Check if AI recommends stopping
+                # Check if AI recommends stopping (only if high confidence achieved)
                 stop_match = re.search(r'STOP_TESTING:\s*(YES|NO)', analysis, re.IGNORECASE)
-                if stop_match and stop_match.group(1).upper() == "YES" and len(successful_payloads) >= 3:
-                    log.info(f"\n[bold green]✓ Sufficient confirmation for {category} ({len(successful_payloads)} successful findings)[/bold green]")
-                    return successful_payloads
+                if stop_match and stop_match.group(1).upper() == "YES" and high_confidence_achieved and len(successful_payloads) >= 2:
+                    log.info(f"\n[bold green]✓ High confidence confirmation achieved for {category} ({len(successful_payloads)} successful findings)[/bold green]")
+                    # Return only high-confidence payloads (>80)
+                    high_conf_payloads = [p for p in successful_payloads if p.get('confidence', 0) > 80]
+                    return high_conf_payloads if high_conf_payloads else successful_payloads
                 
             except Exception as e:
                 log.error(f"  [red]Error processing test {payload_idx}: {e}[/red]")
@@ -944,16 +1000,31 @@ Return ONLY JSON array:
         console.print(f"  • Technologies Detected: {len(set(accumulated_intelligence['technologies_detected']))}")
         console.print(f"  • Working Attack Vectors: {len(set(accumulated_intelligence['working_attack_vectors']))}")
         console.print(f"  • Security Indicators: {len(accumulated_intelligence['security_indicators'])}")
-        console.print(f"  • Total Successful Findings: {len(successful_payloads)}")
+        console.print(f"  • Total Payloads Tested: {len(all_tested_payloads)}")
+        console.print(f"  • Successful Findings: {len(successful_payloads)}")
         
-        # Check if we have strong confirmation
-        if len(successful_payloads) >= 3:
-            high_confidence_count = sum(1 for p in successful_payloads if p.get('confidence', 0) >= 80)
-            if high_confidence_count >= 2:
-                log.info(f"\n[bold green]✓✓✓ STRONG CONFIRMATION for {category}: {high_confidence_count} high-confidence findings.[/bold green]")
-                break
+        # Check if we have high confidence confirmation (>80)
+        high_confidence_payloads = [p for p in successful_payloads if p.get('confidence', 0) > 80]
+        console.print(f"  • High Confidence Payloads (>80): {len(high_confidence_payloads)}")
+        
+        if high_confidence_achieved and len(high_confidence_payloads) >= 2:
+            log.info(f"\n[bold green]✓✓✓ HIGH CONFIDENCE CONFIRMATION for {category}: {len(high_confidence_payloads)} payloads with confidence > 80.[/bold green]")
+            log.info(f"[bold green]Proceeding to exploitation phase...[/bold green]")
+            break
+        elif high_confidence_achieved and len(high_confidence_payloads) >= 1:
+            log.info(f"\n[bold green]✓ High confidence achieved but continuing for more confirmation...[/bold green]")
+        else:
+            log.info(f"\n[yellow]No high confidence yet (>80 required). Continuing iteration...[/yellow]")
     
-    return successful_payloads
+    # Return only high-confidence payloads (>80) for exploitation
+    high_confidence_results = [p for p in successful_payloads if p.get('confidence', 0) > 80]
+    
+    if high_confidence_results:
+        log.info(f"\n[bold green]Returning {len(high_confidence_results)} high-confidence payloads (>80) for exploitation.[/bold green]")
+        return high_confidence_results
+    else:
+        log.warning(f"\n[yellow]No payloads achieved confidence > 80. Returning all successful payloads for review.[/yellow]")
+        return successful_payloads
 
 def _get_category_testing_guide(category: str) -> str:
     """Returns category-specific testing guidelines."""
@@ -1443,11 +1514,29 @@ def _adaptive_poc_generation(
     # Category-specific PoC guidance
     poc_guidance = _get_poc_guidance(category)
     
+    # Prepare payload structures that worked for context
+    successful_payload_structures = []
+    for result in confirmation_results:
+        successful_payload_structures.append({
+            "payload": result.get('payload', 'N/A')[:100],
+            "structure": result.get('payload_structure', 'N/A'),
+            "confidence": result.get('confidence', 0),
+            "request_modifications": result.get('request_modifications', None)
+        })
+    
     # Generate targeted PoC
-    poc_prompt = f"""A {category} vulnerability is CONFIRMED. Generate 6-10 SAFE PoC payloads/tests.
+    poc_prompt = f"""A {category} vulnerability is CONFIRMED with HIGH CONFIDENCE (>80). Generate 6-10 SAFE PoC payloads/tests.
 
-=== CONFIRMED FINDINGS ===
+=== HIGH CONFIDENCE CONFIRMED FINDINGS ===
 {safe_json_dumps(successful_patterns)}
+
+=== SUCCESSFUL PAYLOAD STRUCTURES (USE THESE AS TEMPLATES) ===
+{safe_json_dumps(successful_payload_structures)}
+
+**CRITICAL: Build upon the successful payload structures above!**
+- Use similar patterns and structures
+- Maintain the same request_modifications that worked
+- Escalate based on what was successful
 
 === TECHNOLOGIES DETECTED ===
 {', '.join(set(technologies_detected)) if technologies_detected else 'Unknown'}
@@ -1459,12 +1548,13 @@ def _adaptive_poc_generation(
 {poc_guidance}
 
 **CRITICAL RULES:**
-1. Use the SAME attack vector that worked during confirmation
-2. Extract SAFE, harmless information only
-3. Demonstrate impact without causing damage
-4. Adapt to specific technology/framework detected
-5. Provide clear evidence of vulnerability
-6. Be specific to {category} vulnerability type
+1. Use the SAME attack vector AND structure that worked during confirmation
+2. If successful payloads used request_modifications, KEEP USING THEM
+3. Extract SAFE, harmless information only
+4. Demonstrate impact without causing damage
+5. Adapt to specific technology/framework detected
+6. Provide clear evidence of vulnerability
+7. Be specific to {category} vulnerability type
 
 Return JSON array:
 [
@@ -1473,6 +1563,7 @@ Return JSON array:
     "purpose": "what it demonstrates/extracts",
     "safe": true,
     "expected_result": "what indicates success",
+    "payload_structure": "structure/pattern being used",
     "request_modifications": {{
       "headers_to_remove": ["Authorization"],  // If auth bypass is being tested
       "headers_to_add": {{"X-Custom": "value"}},  // Optional
@@ -1482,7 +1573,7 @@ Return JSON array:
   }}
 ]
 
-**For Auth/Access Control PoCs, include request_modifications to remove auth headers/cookies!**"""
+**MAINTAIN CONSISTENCY: If the confirmed payloads removed Authorization headers, your PoC payloads should too!**"""
 
     ai_response = _call_ai(poc_prompt)
     cleaned_response = _extract_json_from_ai_response(ai_response)
@@ -1987,17 +2078,26 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
             log.info(f"[yellow]No confirmation achieved for '{category}' after adaptive testing. Skipping.[/yellow]")
             continue
         
-        log.info(f"[bold green]✓ Vulnerability CONFIRMED for '{category}' with {len(successful_confirmations)} successful payloads![/bold green]")
-
-        # ===== STAGE 3: ADAPTIVE POC =====
-        status.update(f"[cyan]Stage 3/3: Generating adaptive PoC for '{category}'...[/]")
+        # Check if any high-confidence confirmations exist (>80)
+        high_confidence_confirmations = [p for p in successful_confirmations if p.get('confidence', 0) > 80]
         
+        if not high_confidence_confirmations:
+            log.warning(f"[yellow]Confirmations found for '{category}' but confidence is not high enough (≤80). Skipping exploitation/PoC phase.[/yellow]")
+            log.info(f"[yellow]Found {len(successful_confirmations)} payloads with confidence 60-80, but need confidence >80 for exploitation.[/yellow]")
+            continue
+        
+        log.info(f"[bold green]✓✓✓ High Confidence VULNERABILITY CONFIRMED for '{category}' with {len(high_confidence_confirmations)} payloads (confidence > 80)![/bold green]")
+
+        # ===== STAGE 3: ADAPTIVE POC (Only with high confidence) =====
+        status.update(f"[cyan]Stage 3/3: Generating adaptive PoC for '{category}' (High confidence achieved)...[/]")
+        
+        # Pass only high-confidence confirmations to PoC generation
         successful_poc = _adaptive_poc_generation(
             parsed_request=parsed_request,
             proxy=proxy,
             param_to_test=param_to_test,
             category=category,
-            confirmation_results=successful_confirmations
+            confirmation_results=high_confidence_confirmations  # Only high-confidence results
         )
         
         if not successful_poc:
@@ -2011,11 +2111,11 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
             "category": category,
             "severity": "Critical" if "injection" in category.lower() else "High",
             "detection_reasoning": detection_reasoning,
-            "confirmation_payloads": successful_confirmations,
-            "confirmation_summary": f"{len(successful_confirmations)} payloads confirmed vulnerability through adaptive testing",
+            "confirmation_payloads": high_confidence_confirmations,  # Only high-confidence confirmations
+            "confirmation_summary": f"{len(high_confidence_confirmations)} high-confidence payloads (>80) confirmed vulnerability through adaptive testing",
             "poc_payloads": successful_poc,
             "poc_summary": f"{len([p for p in successful_poc if p['payload'] != 'N/A'])} PoC payloads successful",
-            "adaptive_iterations": "Multiple iterations with learning applied"
+            "adaptive_iterations": "Multiple iterations with learning applied, high confidence achieved (>80)"
         })
 
     # ===== FINAL REPORT GENERATION =====
