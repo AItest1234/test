@@ -237,7 +237,7 @@ def parse_raw_http_request(raw_request_string: str) -> ParsedHttpRequest:
     lines = raw_request_string.strip().split('\n')
     if not lines: raise ValueError("Empty request")
     request_line = lines[0].strip()
-    match = re.match(r'([A-Z]+)\s+([^?\s]+)(\?.*)?\s+HTTP/\d\.\d', request_line)
+    match = re.match(r'([A-Z]+)\s+([^?\s]+)(\?.*)?\s+HTTP/\d+(\.\d+)?', request_line)
     if not match: raise ValueError(f"Invalid request line: {request_line}")
     method, path, query = match.groups()
     path_with_query = path + (query or '')
@@ -246,9 +246,24 @@ def parse_raw_http_request(raw_request_string: str) -> ParsedHttpRequest:
         line = line.strip('\r')
         if not header_section_finished:
             if not line:
+                # Empty line marks end of headers (standard HTTP)
                 header_section_finished = True; continue
-            if ':' in line: key, value = line.split(':', 1); headers[key.strip()] = value.strip()
-        else: body += line + '\n'
+            
+            # Check if this looks like a body (JSON/XML) BEFORE checking for header colon
+            # This handles cases where blank line is missing between headers and body
+            stripped = line.strip()
+            if stripped and (stripped.startswith('{') or stripped.startswith('[') or stripped.startswith('<')):
+                # Looks like JSON or XML body - treat as body even without blank line
+                log.debug(f"Detected body start without blank line: {stripped[:50]}...")
+                header_section_finished = True
+                body += line + '\n'
+            elif ':' in line:
+                # Valid header line (name: value format)
+                key, value = line.split(':', 1)
+                headers[key.strip()] = value.strip()
+            # Otherwise skip malformed header line
+        else: 
+            body += line + '\n'
     body = body.strip()
     host = headers.get('Host')
     if not host: raise ValueError("Host header missing")

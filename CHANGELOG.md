@@ -2,6 +2,41 @@
 
 ## [Unreleased] - 2024-11-20
 
+### Fixed
+
+#### HTTP/2 and HTTP/3 Request Parsing Support
+
+**Problem**: The HTTP request parser only supported HTTP/1.x versions (HTTP/1.0, HTTP/1.1) and would fail to parse valid HTTP/2 and HTTP/3 requests with the error "Invalid request line".
+
+**Solution**: Updated the request line regex pattern in `parse_raw_http_request()` to support all valid HTTP versions:
+- Changed regex from `HTTP/\d\.\d` to `HTTP/\d+(\.\d+)?`
+- Now supports:
+  - HTTP/0.9, HTTP/1.0, HTTP/1.1 (with decimal versions)
+  - HTTP/2, HTTP/3 (single digit versions)
+  - Future HTTP versions
+
+**Files Changed**:
+- `analyzer.py` line 240: Updated request line regex pattern
+
+#### Request Body Parsing Without Blank Line
+
+**Problem**: When pasting HTTP requests without a blank line between headers and body (common when copy-pasting from tools), the request body (JSON, XML) was not being parsed. The body would either be silently ignored or incorrectly treated as a malformed header.
+
+**Solution**: Enhanced the parser to auto-detect body start even without a blank line:
+- Parser now checks if a line starts with `{`, `[`, or `<` (JSON/XML indicators)
+- If detected, treats that line as the start of the body automatically
+- Maintains backward compatibility with standard HTTP format (blank line separator)
+- Provides debug logging when non-standard format is detected
+
+**Benefits**:
+- ✅ Handles copy-pasted requests from Burp Suite, browser DevTools, etc.
+- ✅ Still works correctly with standard HTTP format
+- ✅ Supports JSON objects, JSON arrays, and XML bodies
+- ✅ User-friendly for penetration testing workflows
+
+**Files Changed**:
+- `analyzer.py` lines 244-267: Enhanced body detection logic
+
 ### Added
 
 #### Request Modification Support for VAPT Agent
