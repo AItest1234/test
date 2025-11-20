@@ -35,12 +35,30 @@ import re
 import json
 from urllib.parse import urlparse, parse_qs
 import logging
+import time
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from typing import Any, Dict, List, Union
 
 from .config import settings
+from .ui_components import (
+    print_section_header,
+    create_iteration_panel,
+    print_payload_test_info,
+    print_exploitation_banner,
+    create_extracted_data_table,
+    create_vulnerability_summary,
+    create_statistics_panel,
+    print_data_extraction_success,
+    print_analysis_summary,
+    create_request_modifications_tree,
+    print_stage_transition,
+    print_final_report_header,
+    print_completion_message,
+    print_error,
+    create_test_result_table
+)
 
 log = logging.getLogger("rich")
 
@@ -708,7 +726,8 @@ SUCCESS INDICATORS: {', '.join(strategy['success_indicators'])}
 Your mission: Detect and exploit {category} vulnerabilities through ADAPTIVE, INTELLIGENT testing."""
 
     for iteration in range(1, max_iterations + 1):
-        console.rule(f"[bold cyan]🔄 Iteration {iteration}/{max_iterations} - {category} Testing[/bold cyan]")
+        # Display iteration progress with improved UI
+        create_iteration_panel(iteration, max_iterations, category)
         
         # ===== STEP 1: GENERATE CATEGORY-SPECIFIC PAYLOADS =====
         if iteration == 1:
@@ -876,14 +895,13 @@ Return ONLY JSON array with structured test objects:
                 request_modifications = None
                 if isinstance(payload_obj, dict) and 'request_modifications' in payload_obj:
                     request_modifications = payload_obj.get('request_modifications')
-                    log.info(f"\n[bold white]  Testing Payload {payload_idx}/{len(payload_batch)} with Request Modifications:[/bold white]")
-                    log.info(f"  [yellow]Test:[/yellow] {payload[:80]}...")
-                    log.info(f"  [yellow]Type:[/yellow] {test_type}")
-                    log.info(f"  [cyan]Modifications:[/cyan] {safe_json_dumps(request_modifications)}")
+                    print_payload_test_info(payload_idx, len(payload_batch), payload, test_type, request_modifications)
+                    
+                    # Show modifications tree for complex cases
+                    if len(request_modifications) > 2:
+                        create_request_modifications_tree(request_modifications)
                 else:
-                    log.info(f"\n[bold white]  Testing Payload {payload_idx}/{len(payload_batch)}:[/bold white]")
-                    log.info(f"  [yellow]Test:[/yellow] {payload[:80]}...")
-                    log.info(f"  [yellow]Type:[/yellow] {test_type}")
+                    print_payload_test_info(payload_idx, len(payload_batch), payload, test_type)
                 
                 # Send request with modifications
                 response = _send_request(parsed_request, proxy, param_to_test, payload, request_modifications)
@@ -894,13 +912,15 @@ Return ONLY JSON array with structured test objects:
                 # ===== EXPLOITATION MODE: VERIFY DATA EXTRACTION =====
                 if exploitation_mode:
                     purpose = payload_obj.get('purpose', 'data extraction') if isinstance(payload_obj, dict) else 'data extraction'
-                    log.info(f"\n  [bold magenta]🔍 Verifying data extraction...[/bold magenta]")
+                    console.print(f"\n  [bold magenta]🔍 Verifying data extraction...[/bold magenta]")
                     
                     extraction_result = _verify_data_extraction(response, payload, category, purpose)
                     
                     if extraction_result['extracted']:
-                        log.info(f"  [bold green]✓✓✓ DATA EXTRACTED! {extraction_result['data_type']}[/bold green]")
-                        log.info(f"  [bold green]📊 Extracted: {extraction_result['data'][:200]}[/bold green]")
+                        print_data_extraction_success(
+                            extraction_result['data_type'],
+                            extraction_result['data']
+                        )
                         
                         extracted_data.append({
                             "payload": payload,
@@ -912,9 +932,9 @@ Return ONLY JSON array with structured test objects:
                         })
                         
                         successful_exploitation = True
-                        log.info(f"  [bold green]✓ SUCCESSFUL EXPLOITATION! Total extractions: {len(extracted_data)}[/bold green]")
+                        console.print(f"  [bold green]✓ SUCCESSFUL EXPLOITATION! Total extractions: {len(extracted_data)}[/bold green]")
                     else:
-                        log.info(f"  [yellow]⚠ No data extracted yet. Continuing...[/yellow]")
+                        console.print(f"  [yellow]⚠ No data extracted yet. Continuing...[/yellow]")
                 
                 # ===== STEP 3: CATEGORY-AWARE DEEP ANALYSIS =====
                 analysis_prompt = f"""CRITICAL: Perform DEEP ANALYSIS specific to {category} vulnerability.
@@ -984,14 +1004,22 @@ STOP_TESTING: [YES/NO - sufficient confirmation?]"""
 
                 analysis = _call_ai(analysis_prompt)
                 
-                log.info(f"\n[bold magenta]  📊 Analysis Results:[/bold magenta]")
-                
                 # ===== STEP 4: PARSE ANALYSIS AND UPDATE INTELLIGENCE =====
                 verdict_match = re.search(r'VERDICT:\s*(\w+)', analysis, re.IGNORECASE)
                 verdict = verdict_match.group(1).upper() if verdict_match else "UNKNOWN"
                 
                 confidence_match = re.search(r'CONFIDENCE:\s*(\d+)', analysis)
                 confidence = int(confidence_match.group(1)) if confidence_match else 0
+                
+                # Display formatted analysis summary
+                key_findings = []
+                evidence_section = re.search(r'KEY_EVIDENCE:(.*?)(?=EXPLOITATION_PATH|NEXT_RECOMMENDED|$)', analysis, re.DOTALL | re.IGNORECASE)
+                if evidence_section:
+                    for line in evidence_section.group(1).split('\n'):
+                        if line.strip() and line.strip().startswith('-'):
+                            key_findings.append(line.strip()[1:].strip())
+                
+                print_analysis_summary(verdict, confidence, key_findings)
                 
                 # Extract technologies
                 tech_section = re.search(r'TECHNOLOGY_DETECTED:(.*?)(?=VULNERABILITY_INDICATORS|$)', analysis, re.DOTALL | re.IGNORECASE)
@@ -1063,15 +1091,16 @@ STOP_TESTING: [YES/NO - sufficient confirmation?]"""
                     high_confidence_achieved = True
                     exploitation_mode = True  # Switch to exploitation mode
                     successful_payloads.append(result)
-                    log.info(f"  [bold green]✓✓✓ CONFIDENCE > 70 ACHIEVED! Switching to EXPLOITATION MODE...[/bold green]")
+                    console.print(f"  [bold green]✓✓✓ CONFIDENCE > 70 ACHIEVED! Switching to EXPLOITATION MODE...[/bold green]")
                 # If confidence >= 60, add to successful list for tracking
                 elif verdict in ["VULNERABLE", "POTENTIALLY_VULNERABLE"] and confidence >= 60:
                     successful_payloads.append(result)
-                    log.info(f"  [bold yellow]Added to successful findings (needs higher confidence - Total: {len(successful_payloads)})[/bold yellow]")
+                    console.print(f"  [bold yellow]Added to successful findings (needs higher confidence - Total: {len(successful_payloads)})[/bold yellow]")
                 
                 # ===== STEP 5: IMMEDIATE EXPLOITATION IF CONFIDENCE > 70 =====
                 if verdict == "VULNERABLE" and confidence > 70:
-                    log.info(f"\n[bold green]  🚀 CONFIDENCE > 70! Switching to EXPLOITATION mode...[/bold green]")
+                    # Display exploitation banner
+                    print_exploitation_banner()
                     
                     # Include info about what modifications were used if any
                     modifications_used = ""
@@ -2201,17 +2230,25 @@ def perform_full_workflow(raw_request_string: str, owasp_categories: list[str], 
         log.error(f"Failed to parse raw HTTP request: {e}", extra={"markup": True})
         return []
 
+    # Track start time for statistics
+    start_time = time.time()
+    
     with console.status("[cyan]Capturing baseline response...[/]") as status:
         baseline_response_data = _send_request(parsed_request, proxy)
         if not baseline_response_data:
             log.error("Failed to capture a baseline response. Aborting.")
             return []
         log.info("[green]Baseline captured successfully.[/green]")
+    
+    # Track statistics
+    total_payloads_tested = 0
+    categories_tested = 0
 
     for category in owasp_categories:
-        console.rule(f"[bold cyan]Starting Adaptive Analysis for: {category}[/bold cyan]")
+        print_section_header(f"Starting Adaptive Analysis for: {category}")
+        categories_tested += 1
         
-        status.update(f"[cyan]Stage 1/3: Detecting potential '{category}' issues...[/]")
+        print_stage_transition(1, "Detection", category)
         
         detect_prompt = f"""You are a senior VAPT specialist. Evaluate if the "{category}" vulnerability is worth testing.
 
@@ -2244,7 +2281,7 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
         log.info(f"[yellow]Detection found potential '{category}' vulnerability.[/yellow]")
 
         # ===== STAGE 2: ADAPTIVE ITERATIVE CONFIRMATION =====
-        status.update(f"[cyan]Stage 2/3: Adaptive confirmation testing for '{category}'...[/]")
+        print_stage_transition(2, "Adaptive Confirmation Testing", category)
         param_to_test = selected_params[0] if selected_params else "primary parameter"
         
         successful_confirmations = _adaptive_payload_iteration(
@@ -2257,20 +2294,20 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
         )
         
         if not successful_confirmations:
-            log.info(f"[yellow]No confirmation achieved for '{category}' after adaptive testing. Skipping.[/yellow]")
+            console.print(f"\n[yellow]No confirmation achieved for '{category}' after adaptive testing.[/yellow]")
+            console.print(f"[dim]Moving to next category...[/dim]\n")
             continue
         
         # Check if data was extracted during exploitation
         extracted_data = successful_confirmations[0].get('extracted_data', []) if successful_confirmations else []
         
         if extracted_data:
-            log.info(f"[bold green]✓✓✓ EXPLOITATION SUCCESSFUL for '{category}'![/bold green]")
-            log.info(f"[bold green]✓ {len(extracted_data)} data points extracted![/bold green]")
+            console.print(f"\n[bold green]✓✓✓ EXPLOITATION SUCCESSFUL for '{category}'![/bold green]")
+            console.print(f"[bold green]✓ {len(extracted_data)} data points extracted![/bold green]\n")
             
-            # Display extracted data
-            console.print(f"\n[bold green]📊 Extracted Data Summary:[/bold green]")
-            for idx, data_point in enumerate(extracted_data, 1):
-                console.print(f"  [{idx}] {data_point['data_type']}: {data_point['data'][:150]}")
+            # Display extracted data in a formatted table
+            create_extracted_data_table(extracted_data)
+            total_payloads_tested += len(successful_confirmations)
             
             # Skip PoC generation since we already have real exploitation
             log.info(f"[bold cyan]Skipping PoC generation - real data already extracted![/bold cyan]")
@@ -2295,15 +2332,19 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
         high_confidence_confirmations = [p for p in successful_confirmations if p.get('confidence', 0) > 70]
         
         if not high_confidence_confirmations:
-            log.warning(f"[yellow]Confirmations found for '{category}' but confidence not high enough (≤70) and no data extracted.[/yellow]")
-            log.info(f"[yellow]Found {len(successful_confirmations)} payloads with confidence 60-70.[/yellow]")
+            console.print(f"\n[yellow]⚠ Confirmations found for '{category}' but confidence not high enough (≤70).[/yellow]")
+            console.print(f"[yellow]Found {len(successful_confirmations)} payloads with confidence 60-70.[/yellow]")
+            console.print(f"[dim]Skipping PoC generation - confidence threshold not met.[/dim]\n")
             continue
         
-        log.info(f"[bold green]✓✓✓ High Confidence VULNERABILITY CONFIRMED for '{category}' with {len(high_confidence_confirmations)} payloads (confidence > 70)![/bold green]")
-        log.info(f"[bold yellow]⚠ No data extraction during testing. Generating PoC...[/bold yellow]")
+        console.print(f"\n[bold green]✓✓✓ High Confidence VULNERABILITY CONFIRMED for '{category}'![/bold green]")
+        console.print(f"[bold green]Found {len(high_confidence_confirmations)} high-confidence payloads (>70)[/bold green]")
+        console.print(f"[bold yellow]⚠ No data extraction during testing. Generating PoC...[/bold yellow]\n")
+        
+        total_payloads_tested += len(successful_confirmations)
 
         # ===== STAGE 3: ADAPTIVE POC (Only if no data was extracted during exploitation) =====
-        status.update(f"[cyan]Stage 3/3: Generating adaptive PoC for '{category}' (High confidence but no extraction)...[/]")
+        print_stage_transition(3, "Adaptive PoC Generation", category)
         
         # Pass only high-confidence confirmations to PoC generation
         successful_poc = _adaptive_poc_generation(
@@ -2334,7 +2375,31 @@ RECOMMENDED_VECTORS: (which injection types to prioritize)"""
 
     # ===== FINAL REPORT GENERATION =====
     if final_findings:
-        console.rule("[bold green]Generating Final VAPT Report[/bold green]")
+        # Display vulnerability summary
+        console.print("\n")
+        create_vulnerability_summary(final_findings)
+        
+        # Calculate and display statistics
+        end_time = time.time()
+        duration_seconds = int(end_time - start_time)
+        duration_str = f"{duration_seconds // 60}m {duration_seconds % 60}s" if duration_seconds >= 60 else f"{duration_seconds}s"
+        
+        successful_exploits = sum(1 for f in final_findings if f.get('exploitation_successful', False))
+        total_data_extracted = sum(len(f.get('extracted_data', [])) for f in final_findings)
+        
+        stats = {
+            'categories_tested': categories_tested,
+            'vulnerabilities_found': len(final_findings),
+            'successful_exploits': successful_exploits,
+            'data_extracted': total_data_extracted,
+            'total_payloads': total_payloads_tested,
+            'duration': duration_str
+        }
+        
+        create_statistics_panel(stats)
+        
+        # Generate final report
+        print_final_report_header()
         
         # Prepare findings summary for AI
         findings_summary = []
@@ -2451,11 +2516,23 @@ Make the report professional, clear, and actionable. Use proper formatting with 
         ))
         
         # Optionally save to file
+        report_path = "vapt_report.txt"
         try:
-            with open("vapt_report.txt", "w", encoding="utf-8") as f:
+            with open(report_path, "w", encoding="utf-8") as f:
                 f.write(final_report)
-            log.info("[green]Report saved to: vapt_report.txt[/green]")
+            print_completion_message(report_path)
         except Exception as e:
             log.warning(f"Could not save report to file: {e}")
+    else:
+        console.print("\n")
+        console.print(Panel(
+            "[yellow]No vulnerabilities detected during testing.[/yellow]\n\n"
+            "[cyan]This could mean:[/cyan]\n"
+            "  • The application is well-secured\n"
+            "  • The testing scope was limited\n"
+            "  • Additional test categories may be needed",
+            title="[bold green]Assessment Complete[/bold green]",
+            border_style="green"
+        ))
 
     return final_findings
