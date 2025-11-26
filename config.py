@@ -1,52 +1,81 @@
-# vapt_cli/config.py
-from pydantic_settings import BaseSettings
-from rich.console import Console
-import logging
-from rich.logging import RichHandler
+"""Configuration management for WinSCP Extension."""
 
-def setup_logging(debug_mode: bool = False):
-    """Configures logging for the application."""
-    log_level = "DEBUG" if debug_mode else "INFO"
+from typing import Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+class Config(BaseSettings):
+    """Application configuration."""
     
-    # Configure the root logger
-    logging.basicConfig(
-        level=log_level,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True, show_path=debug_mode)]
+    # Application Server Settings
+    app_server_host: str = Field(default="", description="Application server hostname/IP")
+    app_server_port: int = Field(default=22, description="Application server SSH port")
+    app_server_user: str = Field(default="", description="Application server username")
+    app_server_pass: Optional[str] = Field(default=None, description="Application server password")
+    app_server_key_file: Optional[str] = Field(default=None, description="Application server SSH key file")
+    
+    # Fusion Server Settings
+    fusion_server_host: str = Field(default="", description="Fusion server hostname/IP")
+    fusion_server_port: int = Field(default=22, description="Fusion server SSH port")
+    fusion_server_user: str = Field(default="fusion", description="Fusion server username")
+    fusion_server_pass: Optional[str] = Field(default=None, description="Fusion server password")
+    
+    # Deployment Settings
+    app_deployment_folder: str = Field(default="", description="Application deployment folder path")
+    project_name: str = Field(default="", description="Project name (case-sensitive)")
+    application_file: str = Field(default="Application.zip", description="Application file name")
+    application_include: str = Field(default="", description="Regex for DLLs/JARs to include")
+    application_exclude: str = Field(default="", description="Regex for DLLs/JARs to exclude")
+    instrumented_folder: str = Field(default="Instrumented", description="Instrumented folder name")
+    
+    # Technology Stack
+    tech_stack: str = Field(default="JAVA", description="Technology stack (JAVA or DOTNET)")
+    
+    # SSH Key Settings
+    ssh_key_passphrase: Optional[str] = Field(default=None, description="SSH key passphrase")
+    ssh_key_bits: int = Field(default=4096, description="SSH key size in bits")
+    
+    # Paths
+    fusion_insight_path: str = Field(
+        default="C:\\FusionLiteInsight\\FusionLiteProjectService",
+        description="FusionLite Insight service path"
+    )
+    fusion_projects_path: str = Field(
+        default="C:\\FusionLiteProjects",
+        description="Fusion projects base path"
     )
     
-    # Silence overly verbose loggers from libraries
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("openai").setLevel(logging.WARNING)
-
-
-class Settings(BaseSettings):
-    CEREBRAS_API_KEY: str
-    CEREBRAS_API_BASE: str = "https://api.cerebras.ai/v1"
-    CEREBRAS_MODEL: str = "zai-glm-4.6"
-
+    # Logging
+    log_level: str = Field(default="INFO", description="Logging level")
+    debug_mode: bool = Field(default=False, description="Enable debug mode")
+    
     class Config:
-        env_file = ".env"
+        env_prefix = "WINSCP_EXT_"
+        case_sensitive = False
 
-try:
-    settings = Settings()
-except Exception as e:
-    console = Console()
-    console.print(f"[bold red]Error: Configuration not loaded. {e}[/bold red]")
-    console.print("[yellow]Please ensure a .env file exists and contains the CEREBRAS_API_KEY.[/yellow]")
-    exit(1)
 
-# A list of OWASP API Security Top 10 categories for user selection
-OWASP_CATEGORIES = [
-    "A01:2021 - Broken Access Control",
-    "A02:2021 - Cryptographic Failures",
-    "A03:2021 - Injection",
-    "A04:2021 - Insecure Design",
-    "A05:2021 - Security Misconfiguration",
-    "A06:2021 - Vulnerable and Outdated Components",
-    "A07:2021 - Identification and Authentication Failures",
-    "A08:2021 - Software and Data Integrity Failures",
-    "A09:2021 - Security Logging and Monitoring Failures",
-    "A10:2021 - Server-Side Request Forgery (SSRF)"
-]
+# Default configuration templates
+FUSIONLITE_PROPERTIES_TEMPLATE = """# FusionLite Project Configuration
+FusionLiteProject={project_name}
+FusionLiteServerHost={fusion_host}
+FusionLiteServerPort={fusion_port}
+FusionLiteServerUser={fusion_user}
+FusionLiteServerKeyFile={key_file_path}
+FusionLiteServerKeyPass={key_passphrase}
+
+ApplicationFile={app_file}
+ApplicationInclude={app_include}
+ApplicationExclude={app_exclude}
+InstrumentedFile={app_file}
+InstrumentedFolder={instrumented_folder}
+"""
+
+FUSIONLITE_POWERSHELL_TEMPLATE = """# FusionLite Project PowerShell Script
+# This script will be customized based on templates from Fusion server
+"""
+
+PROJECT_PROPERTIES_TEMPLATE = """# Project Configuration
+Name={project_name}
+InstrumentorAddress={app_server_host}
+"""
